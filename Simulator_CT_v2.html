@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Simulator Dukungan CT</title>
+<style>
+:root{--bg:#eef3f7;--cd:#fff;--tx:#14213d;--mu:#5d6b82;--pr:#0f8f7e;--pl:#dff4f0;--am:#e9a23b;--al:#fff4de;--ok:#15803d;--no:#c2410c;--bd:#d8e0ea}
+@media(prefers-color-scheme:dark){:root{--bg:#0e1621;--cd:#162231;--tx:#e8eef6;--mu:#93a3b8;--pr:#3dc9b4;--pl:#12353a;--am:#f0b559;--al:#3a2f18;--ok:#4ade80;--no:#fb923c;--bd:#26364a}}
+*{box-sizing:border-box}body{margin:0;font:16px/1.55 "Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--tx)}
+main{max-width:760px;margin:0 auto;padding:20px 16px 48px}
+.bar{height:6px;background:var(--bd);border-radius:9px;overflow:hidden;margin-bottom:14px}.bar i{display:block;height:100%;background:var(--pr);transition:width .3s}
+.card{background:var(--cd);border:1px solid var(--bd);border-radius:14px;padding:22px}
+.meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;color:var(--mu);font-size:14px;margin-bottom:10px}
+.chip{background:var(--pl);color:var(--pr);border-radius:20px;padding:2px 10px;font-weight:600}.chip.t{background:var(--al);color:var(--am)}
+h1,h2,h3{line-height:1.3;margin:.2em 0 .6em}h3{font-size:19px}
+pre{background:#0f1b2b;color:#d7e6f7;padding:14px;border-radius:10px;overflow:auto;font:14px/1.5 ui-monospace,Consolas,monospace}
+.opt{display:flex;gap:12px;width:100%;text-align:left;margin:8px 0;padding:12px 14px;border:2px solid var(--bd);border-radius:10px;background:var(--cd);color:var(--tx);font:inherit;cursor:pointer}
+.opt b{min-width:26px;height:26px;border-radius:50%;background:var(--pl);color:var(--pr);display:grid;place-items:center;font-size:14px}
+.opt:hover:not(:disabled){border-color:var(--pr)}.opt.ok{border-color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,var(--cd))}
+.opt.no{border-color:var(--no);opacity:.65;text-decoration:line-through}
+button{font:inherit;cursor:pointer}button:focus-visible,input:focus-visible{outline:3px solid var(--am);outline-offset:2px}
+.go{background:var(--pr);color:#fff;border:0;border-radius:10px;padding:10px 20px;font-weight:600}.go:disabled{opacity:.4;cursor:not-allowed}
+.ghost{background:var(--al);color:var(--tx);border:1px solid var(--am);border-radius:10px;padding:8px 14px;margin-top:8px}
+.row{display:flex;justify-content:flex-end;margin-top:16px}.good{color:var(--ok);font-weight:600}.bad{color:var(--no);font-weight:600}
+.sc{margin-top:12px;border-left:5px solid var(--am);background:var(--al);border-radius:0 10px 10px 0;padding:6px 16px 14px}
+.sc h4{margin:14px 0 6px}.q{background:var(--cd);border:1px dashed var(--am);border-radius:8px;padding:8px 12px;margin:6px 0}
+.ck{display:flex;gap:10px;margin:6px 0;align-items:flex-start}.pg{height:6px;background:var(--bd);border-radius:9px;overflow:hidden}.pg i{display:block;height:100%;width:0;background:var(--ok);transition:width .25s}
+.st{background:var(--cd);border-radius:8px;padding:8px 12px;margin:6px 0;border-left:4px solid var(--pr)}
+input[type=text]{font:inherit;padding:10px 12px;border:2px solid var(--bd);border-radius:10px;background:var(--cd);color:var(--tx);width:100%;margin:8px 0}
+.kv{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0}.kv div{background:var(--pl);border-radius:10px;padding:10px;text-align:center}.kv b{display:block;font-size:20px}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body><main id="app"></main>
+<script>
+const CONFIG={CSV_URL:"bank_soal.csv",MODEL_URL:"model.json",APPS_SCRIPT_URL:"",
+  // Model awal (perkiraan dari profil sintetis). Diganti otomatis jika model.json dari K-Means.ipynb tersedia.
+  MODEL:{mean:[73.3,1.1,60],std:[31.6,0.78,21.8],centroids_z:[[-1.05,-1.03,1.15],[-0.10,-0.13,0],[1.16,1.15,-1.15]]}};
+const TIER_NAMA={1:"Dukungan ringan",2:"Dukungan sedang",3:"Dukungan penuh"};
+const $=s=>document.querySelector(s),app=$("#app");
+const esc=t=>String(t??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const L=s=>(s||"").split("|").map(x=>x.trim()).filter(Boolean);
+let Q=[],S={};
+
+function parseCSV(t){const r=[];let row=[],f="",q=false;
+  for(let i=0;i<t.length;i++){const c=t[i];
+    if(q){if(c=='"'){if(t[i+1]=='"'){f+='"';i++}else q=false}else f+=c}
+    else if(c=='"')q=true;else if(c==","){row.push(f);f=""}
+    else if(c=="\n"){row.push(f);r.push(row);row=[];f=""}else if(c!="\r")f+=c}
+  if(f||row.length){row.push(f);r.push(row)}
+  const h=r.shift().map(x=>x.trim());
+  return r.filter(x=>x.length>1).map(x=>Object.fromEntries(h.map((k,i)=>[k,(x[i]||"").replace(/^\n+/,"").trimEnd()])))}
+
+async function init(){
+  let rows=[];
+  try{rows=parseCSV(await (await fetch(CONFIG.CSV_URL)).text())}catch(e){}
+  try{CONFIG.MODEL=await (await fetch(CONFIG.MODEL_URL)).json()}catch(e){}
+  rows.length?home(rows):upload()}
+function upload(){app.innerHTML=`<div class=card><h2>Muat bank soal</h2><p>File <b>bank_soal.csv</b> tidak ditemukan otomatis. Pilih file CSV bank soal:</p><input type=file id=f accept=".csv"></div>`;
+  $("#f").onchange=e=>{const r=new FileReader();r.onload=()=>home(parseCSV(r.result));r.readAsText(e.target.files[0])}}
+
+function home(rows){
+  const isD=(x,i)=>x.fase?x.fase=="diag":i<10;
+  Q=[...rows.filter(isD),...rows.filter((x,i)=>!isD(x,i))];
+  const nd=rows.filter(isD).length;
+  app.innerHTML=`<div class=card><h1>Simulator Dukungan CT</h1>
+  <p>Kamu akan mengerjakan ${Q.length} soal abstraksi dan dekomposisi. Jawaban langsung diperiksa, dan kamu baru bisa lanjut setelah jawabannya benar.</p>
+  <p>${nd} soal pertama tanpa bantuan. Setelah itu sistem menentukan tingkat bantuan yang cocok untukmu.</p>
+  <label for=sid>ID siswa</label><input type=text id=sid placeholder="mis. S01"><div class=row><button class=go id=st>Mulai</button></div></div>`;
+  $("#st").onclick=()=>{S={sid:$("#sid").value.trim()||"anon",i:0,nd,log:[],tier:null,eff:0,streak:0,fe:null};show()}}
+
+function show(){
+  const it=Q[S.i],lat=S.i>=S.nd;S.cur={t0:performance.now(),wrong:0,help:0,done:false};
+  app.innerHTML=`<div class=bar><i style="width:${S.i/Q.length*100}%"></i></div><div class=card>
+  <div class=meta><span class=chip>${esc(it.pilar)}</span><span>${esc(it.bloom)}</span><span>Soal ${S.i+1} dari ${Q.length}</span>${lat?`<span class="chip t">Bantuan tingkat ${S.eff}</span>`:`<span class=chip>Diagnostik</span>`}</div>
+  <h3>${esc(it.soal)}</h3>${it.kode?`<pre>${esc(it.kode)}</pre>`:""}
+  <div>${"abcd".split("").map(k=>`<button class=opt data-k="${k.toUpperCase()}"><b>${k.toUpperCase()}</b><span>${esc(it["opsi_"+k])}</span></button>`).join("")}</div>
+  <div id=fb aria-live=polite></div>${lat?`<button class=ghost id=hb>Butuh bantuan?</button><div id=sc></div>`:""}
+  <div class=row><button class=go id=nx disabled>Lanjut</button></div></div>`;
+  document.querySelectorAll(".opt").forEach(b=>b.onclick=()=>{
+    if(S.cur.done)return;
+    if(b.dataset.k==it.kunci.trim().toUpperCase()){
+      S.cur.done=true;b.classList.add("ok");const sec=(performance.now()-S.cur.t0)/1000;
+      S.log.push({sid:S.sid,item:it.id,pilar:it.pilar,fase:lat?"latih":"diag",waktu:+sec.toFixed(1),salah:S.cur.wrong,benar_pertama:S.cur.wrong?0:1,bantuan:S.cur.help,tier:lat?S.eff:""});
+      $("#fb").innerHTML=`<p class=good>Benar. Kamu bisa lanjut.</p>`;$("#nx").disabled=false;
+      if(lat){S.streak=S.cur.wrong?0:S.streak+1;if(S.streak>=2&&S.eff>1){S.eff--;S.streak=0}} // bantuan memudar
+    }else{S.cur.wrong++;b.classList.add("no");b.disabled=true;$("#fb").innerHTML=`<p class=bad>Belum tepat. Baca lagi soalnya, lalu coba pilihan lain.</p>`}});
+  if(lat){let open=false;$("#hb").onclick=()=>{open=!open;if(open){S.cur.help++;$("#sc").innerHTML=scaffold(it);wire()}else $("#sc").innerHTML=""}}
+  $("#nx").onclick=()=>{S.i++;S.i>=Q.length?finish():S.i==S.nd?profil():show()}}
+
+function scaffold(it){const t=S.eff;
+  let h=`<div class=sc><h4>Pertanyaan pemandu</h4>${L(it.tier1).map(q=>`<div class=q>${esc(q)}</div>`).join("")}`;
+  if(t>=2){const c=L(it.tier2);h+=`<h4>Daftar periksa</h4>${c.map(x=>`<label class=ck><input type=checkbox>${esc(x)}</label>`).join("")}<div class=pg><i id=pgi></i></div><div class=q>Cek diri: sudah kamu periksa semua pilihan, bukan hanya satu?</div>`}
+  if(t>=3){h+=`<h4>Contoh serupa (soal lain)</h4><p>${esc(it.tier3_soal)}</p><div id=stp></div><button class=ghost id=stn>Tampilkan langkah berikutnya</button>`}
+  return h+"</div>"}
+function wire(){const cb=[...document.querySelectorAll(".ck input")];
+  cb.forEach(c=>c.onchange=()=>{$("#pgi").style.width=cb.filter(x=>x.checked).length/cb.length*100+"%"});
+  const n=$("#stn");if(n){const st=L(Q[S.i].tier3_langkah);let k=0;
+    n.onclick=()=>{if(k<st.length){$("#stp").insertAdjacentHTML("beforeend",`<div class=st>Langkah ${k+1}. ${esc(st[k])}</div>`);k++}if(k>=st.length)n.disabled=true}}}
+
+function feats(){const d=S.log.filter(l=>l.fase=="diag"),n=d.length||1,s=k=>d.reduce((a,b)=>a+b[k],0);
+  return{completion_time:s("waktu")/n,answer_revisions:s("salah")/n,accuracy_score:s("benar_pertama")/n*100}}
+function dispatchTier(f){const M=CONFIG.MODEL,x=[f.completion_time,f.answer_revisions,f.accuracy_score].map((v,i)=>(v-M.mean[i])/M.std[i]);
+  let b=0,bd=1e9;M.centroids_z.forEach((c,i)=>{const d=Math.hypot(...c.map((v,j)=>v-x[j]));if(d<bd){bd=d;b=i}});return b+1}
+
+function profil(){S.fe=feats();S.tier=S.eff=dispatchTier(S.fe);
+  app.innerHTML=`<div class=card><h2>Profil dukunganmu: ${TIER_NAMA[S.tier]}</h2>
+  <p>Dari ${S.nd} soal diagnostik, sistem membaca pola pengerjaanmu. Ini bukan nilai, hanya penentu bantuan yang paling pas. Pada soal berikutnya ada tombol <b>Butuh bantuan?</b>.</p>
+  <div class=kv><div><b>${S.fe.completion_time.toFixed(0)} dtk</b>waktu per soal</div><div><b>${S.fe.answer_revisions.toFixed(1)}</b>percobaan salah per soal</div><div><b>${S.fe.accuracy_score.toFixed(0)}%</b>benar di percobaan pertama</div></div>
+  <div class=row><button class=go id=c>Mulai latihan</button></div></div>`;$("#c").onclick=show}
+
+function csvOut(){const h=Object.keys(S.log[0]);return [h.join(","),...S.log.map(r=>h.map(k=>r[k]).join(","))].join("\n")}
+function finish(){const skor=S.log.reduce((a,b)=>a+b.benar_pertama,0);
+  if(CONFIG.APPS_SCRIPT_URL)fetch(CONFIG.APPS_SCRIPT_URL,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain"},body:JSON.stringify({sid:S.sid,tier:S.tier,features:S.fe,log:S.log})});
+  app.innerHTML=`<div class=bar><i style="width:100%"></i></div><div class=card><h2>Selesai</h2>
+  <p>Skor (benar di percobaan pertama): <b>${skor} dari ${Q.length}</b>. Tingkat bantuan awal: <b>${TIER_NAMA[S.tier]||"-"}</b>.</p>
+  <p>${CONFIG.APPS_SCRIPT_URL?"Data pengerjaan sudah dikirim.":"Unduh data pengerjaan dan kirim ke peneliti."}</p>
+  <div class=row><button class=go id=dl>Unduh log (CSV)</button></div></div>`;
+  $("#dl").onclick=()=>{const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csvOut()],{type:"text/csv"}));a.download="log_"+S.sid+".csv";a.click()}}
+init();
+</script></body></html>
