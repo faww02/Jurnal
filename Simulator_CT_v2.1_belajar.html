@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>Simulator Dukungan CT</title>
+<style>
+/* ===== TAMPILAN (CSS). Bagian ini hanya mengatur warna dan bentuk. ===== */
+body   { font-family: system-ui, sans-serif; background: #eef3f7; color: #14213d; margin: 0; }
+main   { max-width: 740px; margin: 0 auto; padding: 20px 16px; }          /* kolom tengah */
+.card  { background: #fff; border: 1px solid #d8e0ea; border-radius: 14px; padding: 22px; }
+pre    { background: #0f1b2b; color: #d7e6f7; padding: 14px; border-radius: 10px; overflow: auto; }
+.opsi  { display: block; width: 100%; text-align: left; margin: 8px 0; padding: 12px;
+         border: 2px solid #d8e0ea; border-radius: 10px; background: #fff; font-size: 16px; cursor: pointer; }
+.benar { border-color: #15803d; background: #e6f6ec; }                    /* opsi yang dipilih dan benar */
+.salah { border-color: #c2410c; opacity: .6; text-decoration: line-through; } /* opsi salah */
+.go    { background: #0f8f7e; color: #fff; border: 0; border-radius: 10px; padding: 10px 20px; font-size: 16px; cursor: pointer; }
+.go:disabled { opacity: .4; cursor: not-allowed; }                        /* tombol Lanjut yang terkunci */
+.bantuan { border-left: 5px solid #e9a23b; background: #fff4de; padding: 4px 16px 12px; margin-top: 12px; }
+.kartu { background: #fff; border: 1px dashed #e9a23b; border-radius: 8px; padding: 8px 12px; margin: 6px 0; }
+.langkah { background: #fff; border-left: 4px solid #0f8f7e; padding: 8px 12px; margin: 6px 0; }
+.bar   { height: 6px; background: #d8e0ea; border-radius: 9px; overflow: hidden; margin-bottom: 12px; }
+.bar i { display: block; height: 100%; background: #0f8f7e; }             /* isi bilah kemajuan */
+</style>
+</head>
+<body>
+<main id="app"></main>   <!-- "panggung": semua layar dimasukkan ke sini oleh JavaScript -->
+
+<script>
+/* =====================================================================
+   BAGIAN 1. PENGATURAN. Satu tempat untuk angka yang sering diubah.
+   ===================================================================== */
+const CSV_URL = "bank_soal.csv";      // nama file bank soal (satu folder dengan HTML ini)
+const MODEL_URL = "model.json";       // hasil ekspor K-Means.ipynb (boleh belum ada)
+const APPS_SCRIPT_URL = "";           // isi jika ingin kirim data ke Google Sheets
+const JUMLAH_DIAGNOSTIK = 10;         // dipakai jika kolom "fase" di CSV kosong
+
+// Model cadangan: dipakai jika model.json tidak ditemukan.
+// mean/std = untuk standarisasi; pusat = tiga pusat klaster (urut Tier 1, 2, 3).
+let MODEL = {
+  mean: [73.3, 1.1, 60],                          // rata-rata: waktu, revisi, akurasi
+  std:  [31.6, 0.78, 21.8],                       // simpangan baku
+  pusat: [[-1.05,-1.03,1.15], [-0.10,-0.13,0], [1.16,1.15,-1.15]]
+};
+const NAMA_TIER = { 1: "Dukungan ringan", 2: "Dukungan sedang", 3: "Dukungan penuh" };
+
+/* =====================================================================
+   BAGIAN 2. ALAT BANTU KECIL
+   ===================================================================== */
+const app = document.getElementById("app");       // ambil "panggung" dari halaman
+
+function aman(teks) {                             // ubah karakter khusus HTML agar tidak merusak tampilan
+  return String(teks || "")
+    .replace(/&/g, "&amp;")                       // & -> &amp;
+    .replace(/</g, "&lt;")                        // < -> &lt;
+    .replace(/>/g, "&gt;");                       // > -> &gt;  (penting: soal berisi kode seperti a > b)
+}
+
+function pecah(teks) {                            // "a | b | c" -> ["a","b","c"]
+  return String(teks || "").split("|").map(x => x.trim()).filter(x => x !== "");
+}
+
+/* =====================================================================
+   BAGIAN 3. MEMBACA CSV. Mengubah teks CSV menjadi daftar soal.
+   ===================================================================== */
+function bacaCSV(teks) {
+  const hasil = [];                               // daftar semua baris
+  let baris = [], sel = "", dalamKutip = false;   // baris sekarang, isi sel sekarang, status kutip
+  for (let i = 0; i < teks.length; i++) {         // baca huruf demi huruf
+    const h = teks[i];
+    if (dalamKutip) {
+      if (h === '"' && teks[i + 1] === '"') { sel += '"'; i++; }   // "" di dalam kutip = satu tanda kutip
+      else if (h === '"') { dalamKutip = false; }                  // kutip penutup
+      else { sel += h; }                                           // huruf biasa (koma dan baris baru ikut masuk)
+    } else if (h === '"') { dalamKutip = true; }                   // kutip pembuka
+    else if (h === ",")  { baris.push(sel); sel = ""; }            // koma = pindah kolom
+    else if (h === "\n") { baris.push(sel); hasil.push(baris); baris = []; sel = ""; } // baris baru = pindah baris
+    else if (h !== "\r") { sel += h; }
+  }
+  if (sel !== "" || baris.length) { baris.push(sel); hasil.push(baris); }
+  const judul = hasil.shift().map(x => x.trim());                  // baris pertama = nama kolom
+  return hasil.filter(b => b.length > 1).map(b => {                // tiap baris -> objek {kolom: isi}
+    const obj = {};
+    judul.forEach((nama, i) => obj[nama] = (b[i] || "").trimEnd());
+    return obj;
+  });
+}
+
+/* =====================================================================
+   BAGIAN 4. STATE: semua data yang berubah selama simulator berjalan.
+   ===================================================================== */
+let SOAL = [];        // urutan soal (diagnostik dulu, lalu latihan)
+let S = {};           // data siswa: id, nomor soal, log, tier, ...
+
+/* =====================================================================
+   BAGIAN 5. MULAI: muat soal dan model, lalu tampilkan beranda.
+   ===================================================================== */
+async function mulai() {
+  let baris = [];
+  try {                                           // coba ambil CSV otomatis
+    const r = await fetch(CSV_URL);
+    baris = bacaCSV(await r.text());
+  } catch (e) { /* gagal: nanti minta unggah manual */ }
+  try {                                           // coba ambil model.json
+    const r = await fetch(MODEL_URL);
+    const m = await r.json();
+    MODEL = { mean: m.mean, std: m.std, pusat: m.centroids_z };
+  } catch (e) { /* tidak ada: pakai model cadangan */ }
+  if (baris.length > 0) beranda(baris); else layarUnggah();
+}
+
+function layarUnggah() {                          // jika CSV tidak termuat otomatis
+  app.innerHTML = `<div class="card"><h2>Muat bank soal</h2>
+    <input type="file" id="berkas" accept=".csv"></div>`;
+  document.getElementById("berkas").onchange = e => {
+    const pembaca = new FileReader();
+    pembaca.onload = () => beranda(bacaCSV(pembaca.result));
+    pembaca.readAsText(e.target.files[0]);
+  };
+}
+
+function beranda(baris) {
+  // soal "diag" (atau JUMLAH_DIAGNOSTIK soal pertama) ditaruh di depan
+  const diag = baris.filter((x, i) => x.fase ? x.fase === "diag" : i < JUMLAH_DIAGNOSTIK);
+  const latih = baris.filter(x => !diag.includes(x));
+  SOAL = diag.concat(latih);
+  app.innerHTML = `<div class="card"><h1>Simulator Dukungan CT</h1>
+    <p>${SOAL.length} soal. Jawaban langsung diperiksa dan kamu lanjut setelah benar.</p>
+    <p>${diag.length} soal pertama tanpa bantuan untuk menentukan tingkat bantuanmu.</p>
+    <input type="text" id="idsiswa" placeholder="ID siswa, mis. S01">
+    <p><button class="go" id="tombolMulai">Mulai</button></p></div>`;
+  document.getElementById("tombolMulai").onclick = () => {
+    S = { id: document.getElementById("idsiswa").value || "anon",
+          i: 0,                    // nomor soal sekarang (mulai dari 0)
+          nDiag: diag.length,      // jumlah soal diagnostik
+          log: [],                 // catatan semua soal yang sudah dijawab
+          tier: 0,                 // hasil klaster (diisi setelah diagnostik)
+          tierAktif: 0,            // tier yang sedang dipakai (bisa turun)
+          beruntun: 0 };           // hitung benar-pertama berturut-turut
+    tampilSoal();
+  };
+}
+
+/* =====================================================================
+   BAGIAN 6. MENAMPILKAN SATU SOAL DAN MEMERIKSA JAWABAN
+   ===================================================================== */
+function tampilSoal() {
+  const soal = SOAL[S.i];                         // soal yang sedang dikerjakan
+  const fase = S.i >= S.nDiag ? "latih" : "diag"; // sebelum nDiag = diagnostik
+  S.cur = { mulai: performance.now(), salah: 0, bantuan: 0, selesai: false }; // reset catatan soal ini
+
+  const opsiHTML = ["A", "B", "C", "D"].map(h =>   // buat empat tombol opsi
+    `<button class="opsi" data-h="${h}"><b>${h}.</b> ${aman(soal["opsi_" + h.toLowerCase()])}</button>`).join("");
+
+  app.innerHTML = `
+    <div class="bar"><i style="width:${S.i / SOAL.length * 100}%"></i></div>
+    <div class="card">
+      <small>${aman(soal.pilar)} | ${aman(soal.bloom)} | Soal ${S.i + 1} dari ${SOAL.length}
+        | ${fase === "latih" ? "Bantuan tingkat " + S.tierAktif : "Diagnostik"}</small>
+      <h3>${aman(soal.soal)}</h3>
+      ${soal.kode ? "<pre>" + aman(soal.kode) + "</pre>" : ""}
+      ${opsiHTML}
+      <div id="umpanBalik"></div>
+      ${fase === "latih" ? '<button id="tombolBantuan">Butuh bantuan?</button><div id="areaBantuan"></div>' : ""}
+      <p style="text-align:right"><button class="go" id="lanjut" disabled>Lanjut</button></p>
+    </div>`;
+
+  document.querySelectorAll(".opsi").forEach(tombol => {
+    tombol.onclick = () => periksa(tombol, soal, fase);
+  });
+  if (fase === "latih") {
+    document.getElementById("tombolBantuan").onclick = () => bukaBantuan(soal);
+  }
+  document.getElementById("lanjut").onclick = lanjut;
+}
+
+function periksa(tombol, soal, fase) {
+  if (S.cur.selesai) return;                      // soal sudah benar, abaikan klik berikutnya
+  const umpan = document.getElementById("umpanBalik");
+  if (tombol.dataset.h === soal.kunci.trim().toUpperCase()) {
+    // ---- JAWABAN BENAR ----
+    S.cur.selesai = true;
+    tombol.classList.add("benar");
+    const detik = (performance.now() - S.cur.mulai) / 1000;     // waktu sampai benar
+    S.log.push({                                  // simpan catatan soal ini
+      id_siswa: S.id, id_soal: soal.id, pilar: soal.pilar, fase: fase,
+      waktu: Math.round(detik * 10) / 10,
+      salah: S.cur.salah,                         // jumlah percobaan salah = "revisi"
+      benar_pertama: S.cur.salah === 0 ? 1 : 0,   // 1 jika tak pernah salah
+      bantuan: S.cur.bantuan,
+      tier: fase === "latih" ? S.tierAktif : ""
+    });
+    umpan.innerHTML = "<p style='color:#15803d'>Benar. Kamu bisa lanjut.</p>";
+    document.getElementById("lanjut").disabled = false;         // buka kunci tombol Lanjut
+    if (fase === "latih") {                       // bantuan memudar
+      S.beruntun = S.cur.salah === 0 ? S.beruntun + 1 : 0;
+      if (S.beruntun >= 2 && S.tierAktif > 1) { S.tierAktif--; S.beruntun = 0; }
+    }
+  } else {
+    // ---- JAWABAN SALAH ----
+    S.cur.salah++;                                // tambah hitungan salah
+    tombol.classList.add("salah");
+    tombol.disabled = true;                       // opsi ini tidak bisa dipilih lagi
+    umpan.innerHTML = "<p style='color:#c2410c'>Belum tepat. Baca lagi, lalu coba opsi lain.</p>";
+  }
+}
+
+function lanjut() {
+  S.i++;                                          // ke soal berikutnya
+  if (S.i >= SOAL.length) selesai();              // soal habis -> layar akhir
+  else if (S.i === S.nDiag) layarProfil();        // baru selesai diagnostik -> tentukan profil
+  else tampilSoal();                              // selain itu -> soal biasa
+}
+
+/* =====================================================================
+   BAGIAN 7. MENENTUKAN PROFIL (TIER) DENGAN MODEL K-MEANS
+   ===================================================================== */
+function hitungFitur() {                          // rata-rata dari soal diagnostik saja
+  const d = S.log.filter(l => l.fase === "diag");
+  const rata = kunci => d.reduce((a, l) => a + l[kunci], 0) / (d.length || 1);
+  return { waktu: rata("waktu"),                  // detik per soal
+           revisi: rata("salah"),                 // percobaan salah per soal
+           akurasi: rata("benar_pertama") * 100 }; // persen benar pertama
+}
+
+function tentukanTier(f) {
+  // 1) standarisasi: (nilai - rata-rata) / simpangan baku
+  const x = [f.waktu, f.revisi, f.akurasi].map((v, i) => (v - MODEL.mean[i]) / MODEL.std[i]);
+  // 2) cari pusat klaster terdekat (jarak Euclidean)
+  let terbaik = 0, jarakMin = Infinity;
+  MODEL.pusat.forEach((p, i) => {
+    const jarak = Math.hypot(p[0] - x[0], p[1] - x[1], p[2] - x[2]);
+    if (jarak < jarakMin) { jarakMin = jarak; terbaik = i; }
+  });
+  return terbaik + 1;                             // indeks 0,1,2 -> Tier 1,2,3
+}
+
+function layarProfil() {
+  S.fitur = hitungFitur();
+  S.tier = S.tierAktif = tentukanTier(S.fitur);
+  app.innerHTML = `<div class="card"><h2>Profilmu: ${NAMA_TIER[S.tier]}</h2>
+    <p>Waktu per soal ${S.fitur.waktu.toFixed(0)} detik, percobaan salah ${S.fitur.revisi.toFixed(1)} per soal,
+       benar di percobaan pertama ${S.fitur.akurasi.toFixed(0)}%.</p>
+    <p>Ini bukan nilai. Ini penentu bantuan yang paling pas. Di soal berikutnya ada tombol "Butuh bantuan?".</p>
+    <button class="go" id="mulaiLatihan">Mulai latihan</button></div>`;
+  document.getElementById("mulaiLatihan").onclick = tampilSoal;
+}
+
+/* =====================================================================
+   BAGIAN 8. SCAFFOLDING VISUAL (kontennya diambil dari kolom CSV)
+   ===================================================================== */
+function bukaBantuan(soal) {
+  const area = document.getElementById("areaBantuan");
+  if (area.innerHTML !== "") { area.innerHTML = ""; return; }   // klik lagi = tutup
+  S.cur.bantuan++;                                // catat bahwa siswa membuka bantuan
+  const t = S.tierAktif;
+  let h = '<div class="bantuan"><h4>Pertanyaan pemandu</h4>'
+        + pecah(soal.tier1).map(q => `<div class="kartu">${aman(q)}</div>`).join("");
+  if (t >= 2) {                                   // Tier 2 = Tier 1 + daftar periksa
+    h += "<h4>Daftar periksa</h4>"
+       + pecah(soal.tier2).map(c => `<label style="display:block"><input type="checkbox" class="cek"> ${aman(c)}</label>`).join("")
+       + '<div class="bar"><i id="kemajuan" style="width:0"></i></div>'
+       + '<div class="kartu">Cek diri: sudah kamu periksa semua pilihan, bukan hanya satu?</div>';
+  }
+  if (t >= 3) {                                   // Tier 3 = Tier 2 + contoh dari soal lain
+    h += `<h4>Contoh serupa (soal lain)</h4><p>${aman(soal.tier3_soal)}</p>
+          <div id="langkah"></div><button id="langkahLagi">Tampilkan langkah berikutnya</button>`;
+  }
+  area.innerHTML = h + "</div>";
+
+  const kotak = Array.from(document.querySelectorAll(".cek"));
+  kotak.forEach(k => k.addEventListener("change", () => {       // update bilah saat dicentang
+    const sudah = kotak.filter(x => x.checked).length;
+    document.getElementById("kemajuan").style.width = (sudah / kotak.length * 100) + "%";
+  }));
+  const tombol = document.getElementById("langkahLagi");
+  if (tombol) {                                   // tampilkan langkah contoh satu per satu
+    const daftar = pecah(soal.tier3_langkah);
+    let n = 0;
+    tombol.onclick = () => {
+      if (n < daftar.length) {
+        document.getElementById("langkah").insertAdjacentHTML("beforeend",
+          `<div class="langkah">Langkah ${n + 1}. ${aman(daftar[n])}</div>`);
+        n++;
+      }
+      if (n >= daftar.length) tombol.disabled = true;
+    };
+  }
+}
+
+/* =====================================================================
+   BAGIAN 9. LAYAR AKHIR: skor, unduh CSV, kirim data
+   ===================================================================== */
+function selesai() {
+  const skor = S.log.reduce((a, l) => a + l.benar_pertama, 0);
+  if (APPS_SCRIPT_URL) {                          // kirim ke Google Sheets jika URL diisi
+    fetch(APPS_SCRIPT_URL, { method: "POST", mode: "no-cors",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ id: S.id, tier: S.tier, fitur: S.fitur, log: S.log }) });
+  }
+  app.innerHTML = `<div class="card"><h2>Selesai</h2>
+    <p>Skor (benar di percobaan pertama): ${skor} dari ${SOAL.length}.</p>
+    <button class="go" id="unduh">Unduh log (CSV)</button></div>`;
+  document.getElementById("unduh").onclick = () => {
+    const kolom = Object.keys(S.log[0]);          // nama kolom dari baris pertama log
+    const teks = [kolom.join(",")]
+      .concat(S.log.map(l => kolom.map(k => l[k]).join(","))).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([teks], { type: "text/csv" }));
+    a.download = "log_" + S.id + ".csv";
+    a.click();
+  };
+}
+
+mulai();   // BARIS TERAKHIR: jalankan simulator
+</script>
+</body>
+</html>
